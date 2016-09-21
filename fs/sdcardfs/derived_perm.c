@@ -29,33 +29,23 @@ static void inherit_derived_state(struct inode *parent, struct inode *child)
 	ci->perm = PERM_INHERIT;
 	ci->userid = pi->userid;
 	ci->d_uid = pi->d_uid;
-	ci->d_gid = pi->d_gid;
-	ci->d_mode = pi->d_mode;
+	ci->under_android = pi->under_android;
 }
 
 /* helper function for derived state */
 void setup_derived_state(struct inode *inode, perm_t perm,
-                        userid_t userid, uid_t uid, gid_t gid, mode_t mode)
+                        userid_t userid, uid_t uid, bool under_android)
 {
 	struct sdcardfs_inode_info *info = SDCARDFS_I(inode);
 
 	info->perm = perm;
 	info->userid = userid;
 	info->d_uid = uid;
-	info->d_gid = gid;
-	info->d_mode = mode;
+	info->under_android = under_android;
 }
 
-void setup_derived_state_for_multiuser_gid(struct inode *inode, perm_t perm,
-                        userid_t userid, uid_t uid, gid_t gid, mode_t mode)
-{
-	struct sdcardfs_inode_info *info = SDCARDFS_I(inode);
-
-	setup_derived_state(inode, perm, userid, uid, gid, mode);
-	info->d_gid = multiuser_get_uid(userid, gid);
-}
-
-void get_derived_permission(struct dentry *parent, struct dentry *dentry)
+/* While renaming, there is a point where we want the path from dentry, but the name from newdentry */
+void get_derived_permission_new(struct dentry *parent, struct dentry *dentry, struct dentry *newdentry)
 {
 	struct sdcardfs_sb_info *sbi = SDCARDFS_SB(dentry->d_sb);
 	struct sdcardfs_inode_info *info = SDCARDFS_I(dentry->d_inode);
@@ -77,63 +67,63 @@ void get_derived_permission(struct dentry *parent, struct dentry *dentry)
 		case PERM_INHERIT:
 			/* Already inherited above */
 			break;
-        case PERM_PRE_ROOT:
+		case PERM_PRE_ROOT:
 			/* Legacy internal layout places users at top level */
 			info->perm = PERM_ROOT;
-			info->userid = simple_strtoul(dentry->d_name.name, NULL, 10);
-            if (sbi->options.sdfs_gid == AID_SDCARD_RW)
-                info->d_gid = sbi->options.sdfs_gid;
-            else
-                info->d_gid = multiuser_get_uid(info->userid, sbi->options.sdfs_gid);
-            info->d_mode = 0771;
+			info->userid = simple_strtoul(newdentry->d_name.name, NULL, 10);
 			break;
 		case PERM_ROOT:
 			/* Assume masked off by default. */
-            info->d_mode = 0770;
-			if (!strcasecmp(dentry->d_name.name, "Android")) {
+			if (!strcasecmp(newdentry->d_name.name, "Android")) {
 				/* App-specific directories inside; let anyone traverse */
 				info->perm = PERM_ANDROID;
-                info->d_mode = 0771;
-            }
-			break;
-		case PERM_ANDROID:
-			if (!strcasecmp(dentry->d_name.name, "data")) {
-				/* App-specific directories inside; let anyone traverse */
-				info->perm = PERM_ANDROID_DATA;
-                info->d_mode = 0771;
-			} else if (!strcasecmp(dentry->d_name.name, "obb")) {
-				/* App-specific directories inside; let anyone traverse */
-				info->perm = PERM_ANDROID_OBB;
-                info->d_mode = 0771;
-				// FIXME : this feature will be implemented later.
-				/* Single OBB directory is always shared */
-                // ex. Fuse daemon..
-                // node->graft_path = fuse->obb_path;
-                // node->graft_pathlen = strlen(fuse->obb_path);
-			} else if (!strcasecmp(dentry->d_name.name, "media")) {
-				/* App-specific directories inside; let anyone traverse */
-				info->perm = PERM_ANDROID_MEDIA;
-                info->d_mode = 0771;
+				info->under_android = true;
 			}
 			break;
-		/* same policy will be applied on PERM_ANDROID_DATA
-		 * and PERM_ANDROID_OBB */
+		case PERM_ANDROID:
+			if (!strcasecmp(newdentry->d_name.name, "data")) {
+				/* App-specific directories inside; let anyone traverse */
+				info->perm = PERM_ANDROID_DATA;
+			} else if (!strcasecmp(newdentry->d_name.name, "obb")) {
+				/* App-specific directories inside; let anyone traverse */
+				info->perm = PERM_ANDROID_OBB;
+				/* Single OBB directory is always shared */
+			} else if (!strcasecmp(newdentry->d_name.name, "media")) {
+				/* App-specific directories inside; let anyone traverse */
+				info->perm = PERM_ANDROID_MEDIA;
+			}
+			break;
 		case PERM_ANDROID_DATA:
 		case PERM_ANDROID_OBB:
 		case PERM_ANDROID_MEDIA:
-			appid = get_appid(sbi->pkgl_id, dentry->d_name.name);
+			appid = get_appid(sbi->pkgl_id, newdentry->d_name.name);
 			if (appid != 0) {
 				info->d_uid = multiuser_get_uid(parent_info->userid, appid);
 			}
-            info->d_mode = 0770;
 			break;
 	}
+}
 
-    info->d_mode = info->d_mode & ~sbi->options.sdfs_mask;
+void get_derived_permission(struct dentry *parent, struct dentry *dentry)
+{
+	get_derived_permission_new(parent, dentry, dentry);
+}
+
+void get_derive_permissions_recursive(struct dentry *parent) {
+	struct dentry *dentry;
+	list_for_each_entry(dentry, &parent->d_subdirs, d_child) {
+		if (dentry->d_inode) {
+			mutex_lock(&dentry->d_inode->i_mutex);
+			get_derived_permission(parent, dentry);
+			fix_derived_permission(dentry->d_inode);
+			get_derive_permissions_recursive(dentry);
+			mutex_unlock(&dentry->d_inode->i_mutex);
+		}
+	}
 }
 
 /* main function for updating derived permission */
-inline void update_derived_permission(struct dentry *dentry)
+inline void update_derived_permission_lock(struct dentry *dentry)
 {
 	struct dentry *parent;
 
@@ -145,6 +135,7 @@ inline void update_derived_permission(struct dentry *dentry)
 	 * 1. need to check whether the dentry is updated or not
 	 * 2. remove the root dentry update
 	 */
+	mutex_lock(&dentry->d_inode->i_mutex);
 	if(IS_ROOT(dentry)) {
 		//setup_default_pre_root_state(dentry->d_inode);
 	} else {
@@ -155,6 +146,7 @@ inline void update_derived_permission(struct dentry *dentry)
 		}
 	}
 	fix_derived_permission(dentry->d_inode);
+	mutex_unlock(&dentry->d_inode->i_mutex);
 }
 
 int need_graft_path(struct dentry *dentry)
@@ -162,10 +154,16 @@ int need_graft_path(struct dentry *dentry)
 	int ret = 0;
 	struct dentry *parent = dget_parent(dentry);
 	struct sdcardfs_inode_info *parent_info= SDCARDFS_I(parent->d_inode);
+	struct sdcardfs_sb_info *sbi = SDCARDFS_SB(dentry->d_sb);
 
 	if(parent_info->perm == PERM_ANDROID &&
 			!strcasecmp(dentry->d_name.name, "obb")) {
+
+		/* /Android/obb is the base obbpath of DERIVED_UNIFIED */
+		if(!(sbi->options.multiuser == false
+				&& parent_info->userid == 0)) {
 			ret = 1;
+		}
 	}
 	dput(parent);
 	return ret;
@@ -183,7 +181,7 @@ int is_obbpath_invalid(struct dentry *dent)
 	 * regarding the uninitialized obb, refer to the sdcardfs_mkdir() */
 	spin_lock(&di->lock);
 	if(di->orig_path.dentry) {
-		if(!di->lower_path.dentry) {
+ 		if(!di->lower_path.dentry) {
 			ret = 1;
 		} else {
 			path_get(&di->lower_path);
@@ -192,8 +190,7 @@ int is_obbpath_invalid(struct dentry *dent)
 			path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
 			if(!path_buf) {
 				ret = 1;
-				printk(KERN_ERR "sdcardfs: "
-					"fail to allocate path_buf in %s.\n", __func__);
+				printk(KERN_ERR "sdcardfs: fail to allocate path_buf in %s.\n", __func__);
 			} else {
 				obbpath_s = d_path(&di->lower_path, path_buf, PATH_MAX);
 				if (d_unhashed(di->lower_path.dentry) ||
@@ -208,6 +205,27 @@ int is_obbpath_invalid(struct dentry *dent)
 		}
 	}
 	spin_unlock(&di->lock);
+	return ret;
+}
+
+int is_base_obbpath(struct dentry *dentry)
+{
+	int ret = 0;
+	struct dentry *parent = dget_parent(dentry);
+	struct sdcardfs_inode_info *parent_info= SDCARDFS_I(parent->d_inode);
+	struct sdcardfs_sb_info *sbi = SDCARDFS_SB(dentry->d_sb);
+
+	spin_lock(&SDCARDFS_D(dentry)->lock);
+	if (sbi->options.multiuser) {
+		if(parent_info->perm == PERM_PRE_ROOT &&
+				!strcasecmp(dentry->d_name.name, "obb")) {
+			ret = 1;
+		}
+	} else  if (parent_info->perm == PERM_ANDROID &&
+			!strcasecmp(dentry->d_name.name, "obb")) {
+		ret = 1;
+	}
+	spin_unlock(&SDCARDFS_D(dentry)->lock);
 	return ret;
 }
 
@@ -231,8 +249,7 @@ int setup_obb_dentry(struct dentry *dentry, struct path *lower_path)
 
 	if(!err) {
 		/* the obbpath base has been found */
-        printk(KERN_DEBUG "sdcardfs: "
-                "the sbi->obbpath is found\n");
+		printk(KERN_INFO "sdcardfs: the sbi->obbpath is found\n");
 		pathcpy(lower_path, &obbpath);
 	} else {
 		/* if the sbi->obbpath is not available, we can optionally
@@ -240,8 +257,9 @@ int setup_obb_dentry(struct dentry *dentry, struct path *lower_path)
 		 * but, the current implementation just returns an error
 		 * because the sdcard daemon also regards this case as
 		 * a lookup fail. */
-		printk(KERN_INFO "sdcardfs: "
-				"the sbi->obbpath is not available\n");
+		printk(KERN_INFO "sdcardfs: the sbi->obbpath is not available\n");
 	}
 	return err;
 }
+
+
